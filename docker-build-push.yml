@@ -1,22 +1,11 @@
-# Plantilla compartida: build + push de imagen Docker a ACR, y deploy a AKS vía GitLab Agent.
-# Cada proyecto que la incluya debe definir en su propio .gitlab-ci.yml:
-#   IMAGE_NAME         -> nombre de la imagen, ej: backend-api-buses / frontend-app-buses
-#   DOCKERFILE_PATH     -> ruta al Dockerfile del proyecto (default: raíz del repo)
-#   K8S_MANIFEST_PATH   -> carpeta en el repo k8s-manifest con los manifiestos de este servicio
-
-variables:
-  ACR_LOGIN_SERVER: "acrbusesjalapa.azurecr.io"
-  DOCKERFILE_PATH: "."
-
-stages:
-  - package
-  - deploy
-
-package:
+.docker_build_push_template:
   stage: package
   image: docker:27
   services:
     - docker:27-dind
+  variables:
+    ACR_LOGIN_SERVER: "acrbusesjalapa.azurecr.io"
+    DOCKERFILE_PATH: "."
   script:
     - docker login $ACR_LOGIN_SERVER -u $ACR_USERNAME -p $ACR_PASSWORD
     - docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA -t $ACR_LOGIN_SERVER/$IMAGE_NAME:latest $DOCKERFILE_PATH
@@ -25,34 +14,3 @@ package:
   rules:
     - if: '$CI_COMMIT_BRANCH == "develop"'
     - if: '$CI_COMMIT_BRANCH == "main"'
-
-.deploy_base:
-  stage: deploy
-  image:
-    name: bitnami/kubectl:1.31
-    entrypoint: [""]
-  script:
-    - kubectl config use-context $KUBE_CONTEXT
-    - kubectl set image deployment/$IMAGE_NAME $IMAGE_NAME=$ACR_LOGIN_SERVER/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA -n $K8S_NAMESPACE
-    - kubectl rollout status deployment/$IMAGE_NAME -n $K8S_NAMESPACE --timeout=120s
-
-deploy_qa:
-  extends: .deploy_base
-  environment:
-    name: qa
-  variables:
-    KUBE_CONTEXT: "municipalidad-jalapa/infraestructura/k8s-manifest:aks-buses-dev"
-    K8S_NAMESPACE: "default"
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "develop"'
-
-deploy_production:
-  extends: .deploy_base
-  environment:
-    name: production
-  variables:
-    KUBE_CONTEXT: "municipalidad-jalapa/infraestructura/k8s-manifest:aks-buses-prod"
-    K8S_NAMESPACE: "default"
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
-      when: manual
