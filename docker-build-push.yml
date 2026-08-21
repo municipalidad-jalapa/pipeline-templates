@@ -6,7 +6,26 @@
   variables:
     ACR_LOGIN_SERVER: "acrbusesjalapa.azurecr.io"
     DOCKERFILE_PATH: "."
+    # Nombres de variables (separados por espacio) que deben existir y no estar
+    # vacias antes de construir la imagen. Vacio por defecto: no afecta a los
+    # jobs que no lo declaren (p. ej. el backend).
+    REQUIRED_BUILD_ARGS: ""
   script:
+    - |
+      if [ -n "$REQUIRED_BUILD_ARGS" ]; then
+        faltantes=""
+        for var in $REQUIRED_BUILD_ARGS; do
+          valor=$(eval echo "\$$var")
+          if [ -z "$valor" ]; then
+            faltantes="$faltantes $var"
+          fi
+        done
+        if [ -n "$faltantes" ]; then
+          echo "ERROR: faltan variables obligatorias para este build:$faltantes"
+          echo "Definilas como variable de CI/CD con el Environment scope correspondiente (qa o production) antes de volver a ejecutar el pipeline."
+          exit 1
+        fi
+      fi
     - docker login $ACR_LOGIN_SERVER -u $ACR_USERNAME -p $ACR_PASSWORD
     - docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA -t $ACR_LOGIN_SERVER/$IMAGE_NAME:latest $DOCKERFILE_PATH
     - docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
