@@ -26,8 +26,17 @@
           exit 1
         fi
       fi
+    - |
+      # Las mismas variables de REQUIRED_BUILD_ARGS se pasan como --build-arg.
+      # Si un job no declara REQUIRED_BUILD_ARGS (p. ej. el backend), esto queda
+      # vacio y el build corre igual que antes, sin --build-arg.
+      BUILD_ARG_FLAGS=""
+      for var in $REQUIRED_BUILD_ARGS; do
+        valor=$(eval echo "\$$var")
+        BUILD_ARG_FLAGS="$BUILD_ARG_FLAGS --build-arg $var=$valor"
+      done
     - docker login $ACR_LOGIN_SERVER -u $ACR_USERNAME -p $ACR_PASSWORD
-    - docker build -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA -t $ACR_LOGIN_SERVER/$IMAGE_NAME:latest $DOCKERFILE_PATH
+    - docker build $BUILD_ARG_FLAGS -t $ACR_LOGIN_SERVER/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA -t $ACR_LOGIN_SERVER/$IMAGE_NAME:latest $DOCKERFILE_PATH
     - docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA
     - docker push $ACR_LOGIN_SERVER/$IMAGE_NAME:latest
   rules:
