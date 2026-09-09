@@ -1,0 +1,93 @@
+name: Build y push de imagen a ACR
+
+# Workflow reutilizable: reemplaza a .docker_build_push_template de GitLab CI.
+# Se llama con `uses: municipalidad-jalapa/pipeline-templates/.github/workflows/docker-build-push.yml@main`
+# y `secrets: inherit`, para que resuelva los secretos del environment de quien llama.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Nombre de la imagen en ACR (sin el registry)"
+        required: true
+        type: string
+      environment:
+        description: "Environment de GitHub (qa | production) del que salen los secretos"
+        required: true
+        type: string
+      dockerfile-path:
+        description: "Contexto de build"
+        required: false
+        type: string
+        default: "."
+      required-build-args:
+        description: >
+          Nombres de variables (separados por espacio) que deben existir y no estar
+          vacias antes de construir. Se pasan ademas como --build-arg. Vacio por
+          defecto: los repos que no lo declaren (p. ej. el backend) construyen igual.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build-push:
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Vite hornea las VITE_* en el bundle al compilar: si falta una, la app
+      # compila igual pero revienta al arrancar en el navegador. Por eso se
+      # valida antes de construir y no despues de desplegar.
+      - name: Validar variables obligatorias y armar --build-arg
+        id: args
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+          VARS_JSON: ${{ toJSON(vars) }}
+          REQUERIDAS: ${{ inputs.required-build-args }}
+        run: |
+          set -euo pipefail
+          faltantes=""
+          : > /tmp/build-args.txt
+          for nombre in $REQUERIDAS; do
+            valor=$(jq -r --arg k "$nombre" '.[$k] // empty' <<< "$VARS_JSON")
+            if [ -z "$valor" ]; then
+              valor=$(jq -r --arg k "$nombre" '.[$k] // empty' <<< "$SECRETS_JSON")
+            fi
+            if [ -z "$valor" ]; then
+              faltantes="$faltantes $nombre"
+            else
+              printf '%s=%s\n' "$nombre" "$valor" >> /tmp/build-args.txt
+            fi
+          done
+          if [ -n "$faltantes" ]; then
+            echo "ERROR: faltan variables obligatorias para este build:$faltantes"
+            echo "Definilas como secreto o variable del environment '${{ inputs.environment }}' antes de volver a ejecutar."
+            exit 1
+          fi
+          echo "Variables validadas: ${REQUERIDAS:-(ninguna)}"
+
+      - name: Login en ACR
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login "${{ vars.ACR_LOGIN_SERVER }}" \
+            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Construir y publicar
+        run: |
+          set -euo pipefail
+          flags=()
+          while IFS= read -r linea; do
+            [ -n "$linea" ] && flags+=(--build-arg "$linea")
+          done < /tmp/build-args.txt
+
+          IMG="${{ vars.ACR_LOGIN_SERVER }}/${{ inputs.image-name }}"
+          docker build "${flags[@]}" \
+            -t "$IMG:${GITHUB_SHA::8}" \
+            -t "$IMG:latest" \
+            "${{ inputs.dockerfile-path }}"
+          docker push "$IMG:${GITHUB_SHA::8}"
+          docker push "$IMG:latest"
+
+      - name: Limpiar credenciales del runner
+        if: always()
+        run: rm -f /tmp/build-args.txt ~/.docker/config.json
