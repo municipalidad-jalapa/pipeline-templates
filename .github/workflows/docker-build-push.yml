@@ -1,93 +1,123 @@
-name: Build y push de imagen a ACR
+name: Construir y publicar imagen (reutilizable)
 
-# Workflow reutilizable: reemplaza a .docker_build_push_template de GitLab CI.
-# Se llama con `uses: municipalidad-jalapa/pipeline-templates/.github/workflows/docker-build-push.yml@main`
-# y `secrets: inherit`, para que resuelva los secretos del environment de quien llama.
+# Reemplaza el `.docker_build_push_template` de GitLab CI (HU Devops-87).
+#
+# Se invoca desde el workflow de cada app con:
+#   uses: municipalidad-jalapa/pipeline-templates/.github/workflows/docker-build-push.yml@main
+# una vez por entorno (qa / production). Construye la imagen y la publica en el
+# Azure Container Registry con DOS tags: el SHA corto del commit (version
+# inmutable, la que despliega Kubernetes) y `latest`.
+#
+# Es un *reusable workflow* y no una composite action a proposito: necesita
+# declarar su propio `environment:` para resolver los secretos y variables de
+# qa/production del repo que lo llama. El repo llamador pasa `secrets: inherit`.
 
 on:
   workflow_call:
     inputs:
       image-name:
-        description: "Nombre de la imagen en ACR (sin el registry)"
+        description: Nombre de la imagen en el ACR (sin servidor ni tag).
         required: true
         type: string
       environment:
-        description: "Environment de GitHub (qa | production) del que salen los secretos"
+        description: Entorno de GitHub (qa | production) del que salen secretos/vars.
         required: true
         type: string
-      dockerfile-path:
-        description: "Contexto de build"
+      build-context:
+        description: Contexto de build (ruta del Dockerfile). Por defecto la raiz.
         required: false
         type: string
         default: "."
+      acr-login-server:
+        description: Servidor del Azure Container Registry.
+        required: false
+        type: string
+        default: acrbusesjalapa.azurecr.io
       required-build-args:
-        description: >
-          Nombres de variables (separados por espacio) que deben existir y no estar
-          vacias antes de construir. Se pasan ademas como --build-arg. Vacio por
-          defecto: los repos que no lo declaren (p. ej. el backend) construyen igual.
+        description: >-
+          Nombres de variables (separados por espacio) que deben existir y no
+          estar vacias, y que ademas se pasan como --build-arg al docker build.
+          Vacio por defecto: los builds que no lo declaren (p. ej. el backend)
+          corren sin ningun --build-arg, igual que antes. La lista sale de UNA
+          sola fuente en el repo llamador (vars.VITE_REQUIRED_BUILD_ARGS) para
+          no duplicarla por entorno: esa duplicacion fue la causa de que QA se
+          desplegara dos veces con la pantalla en negro.
         required: false
         type: string
         default: ""
 
 jobs:
-  build-push:
+  construir-publicar:
     runs-on: ubuntu-22.04
     environment: ${{ inputs.environment }}
+    env:
+      IMAGE_NAME: ${{ inputs.image-name }}
+      ACR_LOGIN_SERVER: ${{ inputs.acr-login-server }}
+      BUILD_CONTEXT: ${{ inputs.build-context }}
+      REQUIRED_BUILD_ARGS: ${{ inputs.required-build-args }}
+      # Todos los secretos y variables del entorno, en JSON, para resolver por
+      # nombre los --build-arg sin enumerarlos aqui (equivalente al
+      # `eval echo \$$var` sobre las variables de CI/CD que usaba GitLab).
+      # GitHub enmascara los valores de secreto en el log aunque pasen por aca.
+      TODOS_SECRETS: ${{ toJSON(secrets) }}
+      TODAS_VARS: ${{ toJSON(vars) }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout del repo llamador
+        uses: actions/checkout@v4
 
-      # Vite hornea las VITE_* en el bundle al compilar: si falta una, la app
-      # compila igual pero revienta al arrancar en el navegador. Por eso se
-      # valida antes de construir y no despues de desplegar.
-      - name: Validar variables obligatorias y armar --build-arg
-        id: args
-        env:
-          SECRETS_JSON: ${{ toJSON(secrets) }}
-          VARS_JSON: ${{ toJSON(vars) }}
-          REQUERIDAS: ${{ inputs.required-build-args }}
+      - name: Validar variables obligatorias del build
         run: |
           set -euo pipefail
+          if [ -z "${REQUIRED_BUILD_ARGS// /}" ]; then
+            echo "Sin required-build-args: no hay nada que validar."
+            exit 0
+          fi
+          # Mapa combinado vars + secrets (si una llave esta en ambos, gana el secreto).
+          mapa=$(jq -s '.[0] * .[1]' <(printf '%s' "$TODAS_VARS") <(printf '%s' "$TODOS_SECRETS"))
           faltantes=""
-          : > /tmp/build-args.txt
-          for nombre in $REQUERIDAS; do
-            valor=$(jq -r --arg k "$nombre" '.[$k] // empty' <<< "$VARS_JSON")
+          for var in $REQUIRED_BUILD_ARGS; do
+            valor=$(printf '%s' "$mapa" | jq -r --arg k "$var" '.[$k] // ""')
             if [ -z "$valor" ]; then
-              valor=$(jq -r --arg k "$nombre" '.[$k] // empty' <<< "$SECRETS_JSON")
-            fi
-            if [ -z "$valor" ]; then
-              faltantes="$faltantes $nombre"
-            else
-              printf '%s=%s\n' "$nombre" "$valor" >> /tmp/build-args.txt
+              faltantes="$faltantes $var"
             fi
           done
           if [ -n "$faltantes" ]; then
             echo "ERROR: faltan variables obligatorias para este build:$faltantes"
-            echo "Definilas como secreto o variable del environment '${{ inputs.environment }}' antes de volver a ejecutar."
+            echo "Definilas como Secret o Variable en el Environment '${{ inputs.environment }}' del repo antes de reintentar."
             exit 1
           fi
-          echo "Variables validadas: ${REQUERIDAS:-(ninguna)}"
+          echo "OK: todas las variables obligatorias del build estan presentes."
 
-      - name: Login en ACR
-        run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | docker login "${{ vars.ACR_LOGIN_SERVER }}" \
-            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+      - name: Login en el ACR
+        run: docker login "$ACR_LOGIN_SERVER" -u "${{ secrets.ACR_USERNAME }}" -p "${{ secrets.ACR_PASSWORD }}"
 
-      - name: Construir y publicar
+      - name: Construir y publicar imagen (tag por commit + latest)
         run: |
           set -euo pipefail
-          flags=()
-          while IFS= read -r linea; do
-            [ -n "$linea" ] && flags+=(--build-arg "$linea")
-          done < /tmp/build-args.txt
-
-          IMG="${{ vars.ACR_LOGIN_SERVER }}/${{ inputs.image-name }}"
-          docker build "${flags[@]}" \
-            -t "$IMG:${GITHUB_SHA::8}" \
-            -t "$IMG:latest" \
-            "${{ inputs.dockerfile-path }}"
-          docker push "$IMG:${GITHUB_SHA::8}"
-          docker push "$IMG:latest"
-
-      - name: Limpiar credenciales del runner
-        if: always()
-        run: rm -f /tmp/build-args.txt ~/.docker/config.json
+          sha="${GITHUB_SHA::8}"
+          ctx="$BUILD_CONTEXT"
+          # El nombre del Dockerfile es sensible a mayusculas en runners Linux:
+          # el frontend usa 'dockerfile' (minuscula) y el backend 'Dockerfile'.
+          if [ -f "$ctx/Dockerfile" ]; then
+            dockerfile="$ctx/Dockerfile"
+          elif [ -f "$ctx/dockerfile" ]; then
+            dockerfile="$ctx/dockerfile"
+          else
+            echo "ERROR: no encontre Dockerfile ni dockerfile en '$ctx'"; exit 1
+          fi
+          # --build-arg por cada variable obligatoria, resuelta del mapa combinado.
+          args=()
+          if [ -n "${REQUIRED_BUILD_ARGS// /}" ]; then
+            mapa=$(jq -s '.[0] * .[1]' <(printf '%s' "$TODAS_VARS") <(printf '%s' "$TODOS_SECRETS"))
+            for var in $REQUIRED_BUILD_ARGS; do
+              valor=$(printf '%s' "$mapa" | jq -r --arg k "$var" '.[$k] // ""')
+              args+=(--build-arg "$var=$valor")
+            done
+          fi
+          docker build ${args[@]+"${args[@]}"} -f "$dockerfile" \
+            -t "$ACR_LOGIN_SERVER/$IMAGE_NAME:$sha" \
+            -t "$ACR_LOGIN_SERVER/$IMAGE_NAME:latest" \
+            "$ctx"
+          docker push "$ACR_LOGIN_SERVER/$IMAGE_NAME:$sha"
+          docker push "$ACR_LOGIN_SERVER/$IMAGE_NAME:latest"
+          echo "Publicado: $ACR_LOGIN_SERVER/$IMAGE_NAME:$sha  (+ :latest)"
