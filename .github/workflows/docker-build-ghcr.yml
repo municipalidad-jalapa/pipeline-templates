@@ -1,0 +1,189 @@
+name: Construir en GHCR y desplegar por SSH (reutilizable)
+
+# Reemplaza a docker-build-push.yml (ACR + AKS) para el servidor k3s en Lightsail.
+# El viejo sigue existiendo hasta que todo salga de Azure.
+#
+# Un solo job por ambiente: construye, revisa que la imagen no lleve secretos
+# (los paquetes son PUBLICOS), la publica y la despliega. Asi produccion pide
+# una sola aprobacion (la del environment).
+#
+# Tags: QA = qa-<sha8>, produccion = <sha8>. El servidor rechaza el tag del otro
+# ambiente, porque la imagen del frontend lleva horneada la URL de su ambiente.
+#
+# El repo que llama necesita:
+#   permissions: contents read + packages write
+#   secrets: inherit
+#   environment qa / production con el secreto DEPLOY_SSH_KEY
+# La llave solo puede ejecutar el comando forzado ecoruta-desplegar del servidor.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "backend-api-buses o frontend-app-buses."
+        required: true
+        type: string
+      environment:
+        description: "qa o production."
+        required: true
+        type: string
+      required-build-args:
+        description: "Variables VITE_ obligatorias del build, separadas por espacio."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  construir-desplegar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: desplegar-${{ inputs.image-name }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      AMBIENTE: ${{ inputs.environment }}
+      IMAGEN: ghcr.io/municipalidad-jalapa/${{ inputs.image-name }}
+      APP: ${{ inputs.image-name }}
+      SERVIDOR: "3.149.211.241"
+      SERVIDOR_LLAVE: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP3HgshVaSO13z3hR2dT8IS4rWM2vKmE9Gue9En8Z5Od"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Calcular tag
+        run: |
+          set -euo pipefail
+          case "$AMBIENTE" in
+            qa) tag="qa-${GITHUB_SHA::8}" ;;
+            production) tag="${GITHUB_SHA::8}" ;;
+            *) echo "::error::environment debe ser qa o production"; exit 1 ;;
+          esac
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Construir
+        env:
+          REQUERIDAS: ${{ inputs.required-build-args }}
+          TODAS_VARS: ${{ toJSON(vars) }}
+          # Solo los secretos que el build usa; nunca todos.
+          SECRETO_VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
+          SECRETO_VITE_GOOGLE_MAPS_API_KEY: ${{ secrets.VITE_GOOGLE_MAPS_API_KEY }}
+        run: |
+          set -euo pipefail
+          args=()
+          faltantes=""
+          read -ra nombres <<< "$REQUERIDAS"
+          for var in "${nombres[@]}"; do
+            if [[ ! "$var" =~ ^VITE_[A-Z0-9_]+$ ]]; then
+              echo "::error::Solo se aceptan build args VITE_ (la imagen es publica): $var"
+              exit 1
+            fi
+            secreto="SECRETO_$var"
+            valor="${!secreto:-}"
+            if [ -z "$valor" ]; then
+              valor=$(printf '%s' "$TODAS_VARS" | jq -r --arg k "$var" '.[$k] // ""')
+            fi
+            if [ -z "$valor" ]; then
+              faltantes="$faltantes $var"
+              continue
+            fi
+            export "$var=$valor"
+            args+=(--build-arg "$var")
+          done
+          if [ -n "$faltantes" ]; then
+            echo "::error::Faltan en el environment $AMBIENTE:$faltantes"
+            exit 1
+          fi
+          dockerfile=Dockerfile
+          [ -f "$dockerfile" ] || dockerfile=dockerfile
+          [ -f "$dockerfile" ] || { echo "::error::No hay Dockerfile"; exit 1; }
+          docker build "${args[@]}" -f "$dockerfile" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGEN:$TAG" .
+
+      - name: Revisar que la imagen no lleve secretos
+        run: |
+          set -euo pipefail
+          docker save "$IMAGEN:$TAG" -o "$RUNNER_TEMP/imagen.tar"
+          python3 -I - "$RUNNER_TEMP/imagen.tar" <<'PY'
+          import gzip, io, json, re, sys, tarfile, zipfile
+          FUERTES = {
+              "cuenta de servicio": rb'"private_key_id"\s*:\s*"[0-9a-f]{40}"',
+              "token de GitHub": rb"(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{60})",
+              "llave de Storage": rb"AccountKey=[A-Za-z0-9+/]{60}",
+              "llave de Tailscale": rb"tskey-[a-z]+-[A-Za-z0-9]{8}",
+          }
+          PEM = rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+          NOMBRE = re.compile(r"(^|/)(\.env[^/]*|id_rsa|id_ed25519|[^/]*\.(jks|p12|pfx|keystore)|[^/]*adminsdk[^/]*\.json)$")
+          malos, total = [], 0
+          def mirar(nombre, datos, propio):
+              global total
+              total += 1
+              for que, patron in FUERTES.items():
+                  if re.search(patron, datos):
+                      malos.append((que, nombre))
+              if propio and (re.search(PEM, datos) or NOMBRE.search(nombre)):
+                  malos.append(("llave o archivo sensible", nombre))
+              if nombre.endswith((".jar", ".war")):
+                  try:
+                      z = zipfile.ZipFile(io.BytesIO(datos))
+                  except zipfile.BadZipFile:
+                      return
+                  for i in z.infolist():
+                      if not i.is_dir():
+                          mirar(nombre + "!" + i.filename, z.read(i), propio and i.filename.startswith("BOOT-INF/classes/"))
+          t = tarfile.open(sys.argv[1])
+          m = json.load(t.extractfile("manifest.json"))[0]
+          mirar("configuracion", t.extractfile(m["Config"]).read(), False)
+          for capa in m["Layers"]:
+              b = t.extractfile(capa).read()
+              if b[:2] == b"\x1f\x8b":
+                  b = gzip.decompress(b)
+              with tarfile.open(fileobj=io.BytesIO(b)) as lt:
+                  for e in lt:
+                      if e.isfile():
+                          propio = e.name.startswith(("app/", "usr/share/nginx/html/"))
+                          mirar(e.name, lt.extractfile(e).read(), propio)
+          for que, nombre in malos:
+              print("::error::%s en %s" % (que, nombre[-160:]))
+          print("%d archivos revisados, %d hallazgos" % (total, len(malos)))
+          sys.exit(1 if malos else 0)
+          PY
+          rm -f "$RUNNER_TEMP/imagen.tar"
+
+      - name: Publicar en GHCR
+        env:
+          GHCR_CLAVE: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_CLAVE" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGEN:$TAG"
+          docker logout ghcr.io
+
+      - name: Desplegar en el servidor
+        env:
+          LLAVE: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$LLAVE" ]; then
+            echo "::error::Falta DEPLOY_SSH_KEY en el environment $AMBIENTE"
+            exit 1
+          fi
+          case "$AMBIENTE" in
+            qa) usuario=despliegue-qa ;;
+            *) usuario=despliegue-prod ;;
+          esac
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/llave" "$RUNNER_TEMP/known_hosts"' EXIT
+          printf '%s\n' "$LLAVE" > "$RUNNER_TEMP/llave"
+          printf '%s %s\n' "$SERVIDOR" "$SERVIDOR_LLAVE" > "$RUNNER_TEMP/known_hosts"
+          ssh -i "$RUNNER_TEMP/llave" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/known_hosts" \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            "$usuario@$SERVIDOR" "desplegar $APP $TAG" </dev/null
